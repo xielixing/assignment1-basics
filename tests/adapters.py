@@ -463,7 +463,15 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    # 假设 in_features: [batch_size, seq_len, d_k] dim = 2
+    # max_num: [batch_size, seq_len, 1] 即指定的 dim 维度会变成 1
+    # 由于 max 函数返回值既有tensor还有indices因此要用 [0]
+    max_num = in_features.max(dim=dim, keepdim=True)[0] # [batch_size, seq_len, 1]
+
+    residue = in_features - max_num # [batch_size, seq_len, d_k]
+    exp_sum = torch.sum(torch.exp(residue), dim=dim, keepdim=True)  # exp_sum: [batch_size, seq_len, 1]
+    return torch.exp(residue) / exp_sum # [batch_size, seq_len, d_k]
+    
 
 
 def run_cross_entropy(
