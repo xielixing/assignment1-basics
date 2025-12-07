@@ -180,6 +180,36 @@ def run_multihead_self_attention_with_rope(
     """
     raise NotImplementedError
 
+import torch.nn as nn
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        if d_k % 2 != 0:
+            raise ValueError('d_k must be even')
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        self.device = device
+        
+        freq = 1.0 / (self.theta**(torch.arange(0, d_k, 2).float() / self.d_k))
+
+        cos_cache =  torch.outer(torch.arange(0, max_seq_len), freq) # (max_seq_len, d/2)
+        sin_cache = torch.outer(torch.arange(0, max_seq_len), freq) # (max_seq_len, d/2)
+        self.register_buffer('cos_cache', cos_cache.cos(), persistent=False) # (max_seq_len, d/2)
+        self.register_buffer('sin_cache', sin_cache.sin(), persistent=False) # (max_seq_len, d/2)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        # x: (batch_size, seq_len, d_k)
+        # token_positions: (batch_size, seq_len)
+        cos = self.cos_cache[token_positions] # (batch_size, seq_len, d/2)
+        sin = self.sin_cache[token_positions] # (batch_size, seq_len, d/2)
+        even = x[..., 0::2] # [batch_size, seq_len, d_k/2]
+        odd = x[..., 1::2] # [batch_size, seq_len, d_k/2]
+        part_1 = cos*even - sin*odd
+        part_2 = cos*odd + sin*even
+        res = torch.stack([part_1, part_2], dim=-1).flatten(start_dim=-2, end_dim=-1)
+        return res
+        
 
 def run_rope(
     d_k: int,
@@ -188,6 +218,7 @@ def run_rope(
     in_query_or_key: Float[Tensor, " ... sequence_length d_k"],
     token_positions: Int[Tensor, " ... sequence_length"],
 ) -> Float[Tensor, " ... sequence_length d_k"]:
+
     """
     Run RoPE for a given input tensor.
 
@@ -200,7 +231,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len)
+    return rope.forward(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
