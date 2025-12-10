@@ -85,6 +85,17 @@ def run_swiglu(
     # swiglu.w3.weight.data = w3_weight
     raise NotImplementedError
 
+class ScaledDotProductAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, Q: torch.tensor, K: torch.tensor, V: torch.tensor, mask: torch.tensor | None = None):
+        d_k = Q.size(-1)
+        scores = torch.matmul(Q, K.transpose(dim0=-1, dim1=-2)) / torch.sqrt(torch.tensor(d_k))
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        attn_weights = torch.matmul(torch.softmax(scores, dim=-1), V)
+        return attn_weights
 
 def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
@@ -104,7 +115,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    scaled_dot_product_attention = ScaledDotProductAttention()
+    return scaled_dot_product_attention.forward(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
