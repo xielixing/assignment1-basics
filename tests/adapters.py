@@ -8,6 +8,19 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from einops import einsum
+
+
+class LinearModule(torch.nn.Module):
+    def __init__(self, d_in: int, d_out: int):
+        super().__init__()
+        self.d_in = d_in
+        self.d_out = d_out
+    
+    def forward(self, in_features: torch.Tensor, weights: torch.Tensor):
+        assert self.d_in == in_features.shape[-1]
+        assert self.d_out == weights.shape[0]
+        return einsum(in_features, weights, "... d_in, d_out d_in -> ... d_out")
 
 
 def run_linear(
@@ -28,9 +41,20 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    LinearLayer = LinearModule(d_in, d_out)
+    return LinearLayer.forward(in_features, weights)
 
-    raise NotImplementedError
-
+class EmbeddingModule(torch.nn.Module):
+    def __init__(self, vocab_size: int, d_model: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+    
+    def forward(self, weights: Float[Tensor, " vocab_size d_model"], token_ids: Int[Tensor, " ..."]):
+        (vocab_size, d_model) = weights.shape
+        assert vocab_size == self.vocab_size
+        assert d_model == self.d_model
+        return weights[token_ids]
 
 def run_embedding(
     vocab_size: int,
@@ -50,9 +74,28 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    EmbeddingLayer = EmbeddingModule(vocab_size, d_model)
+    return EmbeddingLayer.forward(weights, token_ids)
 
-    raise NotImplementedError
+class SwigluModule(torch.nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
 
+    def forward(self, w1_weight: Float[Tensor, " d_ff d_model"],
+                w2_weight: Float[Tensor, " d_model d_ff"],
+                w3_weight: Float[Tensor, " d_ff d_model"],
+                in_features: Float[Tensor, " ... d_model"]):
+        assert w1_weight.shape[0] == self.d_ff
+        assert w2_weight.shape == (self.d_model, self.d_ff)
+        assert w3_weight.shape == (self.d_ff, self.d_model)
+        assert in_features.shape[-1] == self.d_model
+        W_1_x = einsum(w1_weight, in_features, "d_ff d_model, ... d_model -> ... d_ff")
+        Silu_W_1_x = W_1_x / (1 + torch.e ** -W_1_x) # (..., d_ff)
+        W_3_x = einsum(w3_weight, in_features, "d_ff d_model, ... d_model -> ... d_ff")
+        res = Silu_W_1_x * W_3_x # (..., d_ff)
+        return einsum(w2_weight, res, "d_model d_ff, ... d_ff -> ... d_model")
 
 def run_swiglu(
     d_model: int,
@@ -83,7 +126,8 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    SwigluLayer = SwigluModule(d_model, d_ff)
+    return SwigluLayer.forward(w1_weight, w2_weight, w3_weight, in_features)
 
 class ScaledDotProductAttention(torch.nn.Module):
     def __init__(self):
@@ -320,7 +364,7 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer('cos_cache', cos_cache.cos(), persistent=False) # (max_seq_len, d/2)
         self.register_buffer('sin_cache', sin_cache.sin(), persistent=False) # (max_seq_len, d/2)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
         # x: (batch_size, seq_len, d_k)
         # token_positions: (batch_size, seq_len)
         cos = self.cos_cache[token_positions] # (batch_size, seq_len, d/2)
@@ -355,6 +399,60 @@ def run_rope(
     """
     rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len)
     return rope.forward(in_query_or_key, token_positions)
+
+class TransforMerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, 
+                 attn_q_proj_weight: torch.Tensor,
+                 attn_k_proj_weight: torch.Tensor,
+                 attn_v_proj_weight: torch.Tensor,
+                 attn_output_proj_weight: torch.Tensor,
+                 ln1_weight: torch.Tensor,
+                 ffn_w1_weight: torch.Tensor,
+                 ffn_w2_weight: torch.Tensor,
+                 ffn_w3_weight: torch.Tensor,
+                 ln2_weight: torch.Tensor):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        self.attn_q_proj_weight = attn_q_proj_weight # (d_model, d_model)
+        self.attn_k_proj_weight = attn_k_proj_weight # (d_model, d_model)
+        self.attn_v_proj_weight = attn_v_proj_weight # (d_model, d_model)
+        self.attn_output_proj_weight = attn_output_proj_weight # (d_model, d_model)
+        self.ln1_weight = ln1_weight # (d_model,)
+        self.ffn_w1_weight = ffn_w1_weight # (d_model, d_ff)
+        self.ffn_w2_weight = ffn_w2_weight # (d_ff, d_model)
+        self.ffn_w3_weight = ffn_w3_weight # (d_model, d_ff)
+        self.ln2_weight = ln2_weight # (d_model,)
+
+        self.RMS_Layer = RMSNormModule(d_model, 1e-5)
+        self.MHA_ROPE_Layer = MultiHeadAttentionRope(self.num_heads, self.d_model, self.max_seq_len, self.theta)
+        self.FFN_Layer = SwigluModule(self.d_model, self.d_ff)
+
+    def forward(self, in_features: Float[Tensor, " batch sequence_length d_model"]):
+        assert in_features.shape[-1] == self.d_model
+        token_positions = torch.arange(in_features.shape[1])
+
+        part_1_rmsnorm = self.RMS_Layer.forward(self.ln1_weight, in_features)
+        part_1_mha_rope = self.MHA_ROPE_Layer.forward(
+            self.attn_q_proj_weight, 
+            self.attn_k_proj_weight, 
+            self.attn_v_proj_weight, 
+            self.attn_output_proj_weight, 
+            part_1_rmsnorm,
+            token_positions)
+        
+        part_1_output = in_features + part_1_mha_rope
+
+        part_2_rmsnorm = self.RMS_Layer.forward(self.ln2_weight, part_1_output)
+        part_2_ffn = self.FFN_Layer.forward(self.ffn_w1_weight, self.ffn_w2_weight, self.ffn_w3_weight, part_2_rmsnorm)
+        part_2_output = part_1_output + part_2_ffn
+
+        return part_2_output
+
+
 
 
 def run_transformer_block(
@@ -427,8 +525,54 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformer_block = TransforMerBlock(d_model, num_heads, d_ff, max_seq_len, theta, 
+        weights["attn.q_proj.weight"], weights["attn.k_proj.weight"], weights["attn.v_proj.weight"]
+        , weights["attn.output_proj.weight"], weights["ln1.weight"], weights["ffn.w1.weight"],
+        weights["ffn.w2.weight"], weights["ffn.w3.weight"], weights["ln2.weight"])
+    return transformer_block.forward(in_features)
 
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size: int, context_length: int, d_model: int, num_layers: int, num_heads: int, d_ff: int, rope_theta: float, weights: dict[str, Tensor],):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.weights = weights
+        self.EmbeddingLayer = EmbeddingModule(self.vocab_size, self.d_model)
+        self.RmsNormLayer = RMSNormModule(self.d_model, 1e-5)
+        self.LinearLayer = LinearModule(self.d_model, self.vocab_size)
+        self.SoftMaxLayer = SoftMaxModule(-1)
+    
+    def forward(self, in_indices: Int[Tensor, " batch_size sequence_length"]):
+        # [batch_size, seq_len, d_model]
+        token_embedding = self.EmbeddingLayer.forward(self.weights["token_embeddings.weight"], in_indices)
+        for num_layers in range(self.num_layers):
+            transformer_block = TransforMerBlock(
+                self.d_model,
+                self.num_heads,
+                self.d_ff,
+                self.context_length,
+                self.rope_theta,
+                self.weights[f"layers.{num_layers}.attn.q_proj.weight"],
+                self.weights[f"layers.{num_layers}.attn.k_proj.weight"],
+                self.weights[f"layers.{num_layers}.attn.v_proj.weight"],
+                self.weights[f"layers.{num_layers}.attn.output_proj.weight"],
+                self.weights[f"layers.{num_layers}.ln1.weight"],
+                self.weights[f"layers.{num_layers}.ffn.w1.weight"],
+                self.weights[f"layers.{num_layers}.ffn.w2.weight"],
+                self.weights[f"layers.{num_layers}.ffn.w3.weight"],
+                self.weights[f"layers.{num_layers}.ln2.weight"],
+            )
+            token_embedding = transformer_block.forward(token_embedding)
+        ffn_output = self.RmsNormLayer.forward(self.weights["ln_final.weight"], token_embedding)
+        linear_output = self.LinearLayer.forward(ffn_output, self.weights["lm_head.weight"])
+        return linear_output
+        # return self.SoftMaxLayer.forward(linear_output)
+        
 
 def run_transformer_lm(
     vocab_size: int,
@@ -509,8 +653,23 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transforer_lm = TransformerLM(vocab_size, context_length, d_model, num_layers, num_heads,
+        d_ff, rope_theta, weights)
+    return transforer_lm.forward(in_indices)
 
+class RMSNormModule(nn.Module):
+    def __init__(self, d_model: int, eps: float):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+    
+    def forward(self, weights: Float[Tensor, " d_model"], in_features: Float[Tensor, " ... d_model"]):
+        d_model = in_features.shape[-1]
+        assert d_model == self.d_model
+        in_type = in_features.dtype
+        in_features = in_features.to(in_type)
+        RMS = torch.sqrt((in_features ** 2).sum(dim = -1, keepdim=True) / self.d_model + self.eps) # (..., 1)
+        return ((in_features / RMS) * weights).to(in_type) 
 
 def run_rmsnorm(
     d_model: int,
@@ -532,7 +691,8 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    RMSLayer = RMSNormModule(d_model, eps)
+    return RMSLayer.forward(weights, in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -571,6 +731,19 @@ def run_get_batch(
     """
     raise NotImplementedError
 
+class SoftMaxModule(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+    
+    def forward(self, in_features: Float[Tensor, " ..."]):
+        # 假设 in_features: [batch_size, seq_len, d_k] dim = 2
+        # max_num: [batch_size, seq_len, 1] 即指定的 dim 维度会变成 1
+        # 由于 max 函数返回值既有tensor还有indices因此要用 [0]
+        max_num = in_features.max(dim=self.dim, keepdim=True)[0] # [batch_size, seq_len, 1]
+        residue = in_features - max_num # [batch_size, seq_len, d_k]
+        exp_sum = torch.sum(torch.exp(residue), dim=self.dim, keepdim=True)  # exp_sum: [batch_size, seq_len, 1]
+        return torch.exp(residue) / exp_sum # [batch_size, seq_len, d_k]
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     """
@@ -585,14 +758,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    # 假设 in_features: [batch_size, seq_len, d_k] dim = 2
-    # max_num: [batch_size, seq_len, 1] 即指定的 dim 维度会变成 1
-    # 由于 max 函数返回值既有tensor还有indices因此要用 [0]
-    max_num = in_features.max(dim=dim, keepdim=True)[0] # [batch_size, seq_len, 1]
-
-    residue = in_features - max_num # [batch_size, seq_len, d_k]
-    exp_sum = torch.sum(torch.exp(residue), dim=dim, keepdim=True)  # exp_sum: [batch_size, seq_len, 1]
-    return torch.exp(residue) / exp_sum # [batch_size, seq_len, d_k]
+    SoftMaxLayer = SoftMaxModule(dim)
+    return SoftMaxLayer.forward(in_features)
     
 
 
